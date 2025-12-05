@@ -1,0 +1,486 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>手势射击 - 智能校准版</title>
+    <script src="js/camera.js" crossorigin="anonymous"></script>
+    <script src="js/util.js" crossorigin="anonymous"></script>
+    <script src="js/hand.js" crossorigin="anonymous"></script>
+
+  <style>
+    body {
+      margin: 0; padding: 0;
+      background-color: #050505;
+      overflow: hidden;
+      font-family: 'Segoe UI', sans-serif;
+      color: white;
+      user-select: none;
+    }
+    #game-container { position: relative; width: 100vw; height: 100vh; }
+    canvas { display: block; position: absolute; top: 0; left: 0; z-index: 2; }
+
+    #input_video {
+      position: absolute; bottom: 10px; right: 10px;
+      width: 150px; height: auto;
+      transform: scaleX(-1); opacity: 0.3; z-index: 1;
+      border: 1px solid #333; border-radius: 4px;
+    }
+
+    #ui-layer {
+      position: absolute; top: 0; left: 0;
+      width: 100%; height: 100%; z-index: 10;
+      pointer-events: none;
+      display: flex; flex-direction: column;
+      justify-content: center; align-items: center; text-align: center;
+    }
+
+    /* 通用的盒子样式 */
+    .instruction-box {
+      background: rgba(0, 0, 0, 0.85);
+      border: 1px solid #00ffcc;
+      border-radius: 12px;
+      box-shadow: 0 0 20px rgba(0, 255, 204, 0.2);
+      transition: all 0.3s;
+    }
+
+    /* 校准界面：保持大尺寸、居中 */
+    #calibration-ui {
+      padding: 30px 60px;
+    }
+
+    /* --- [修改] 游戏界面：移动到右上角并缩小 --- */
+    #game-ui {
+      position: absolute;     /* 绝对定位，脱离居中流 */
+      top: 20px;              /* 距离顶部 */
+      right: 20px;            /* 距离右侧 */
+      padding: 10px 25px;     /* 缩小内边距 */
+      text-align: right;      /* 文字右对齐更美观 */
+    }
+
+    /* 针对游戏界面的标题缩小 */
+    #game-ui h1 {
+      margin: 0;
+      font-size: 1.5rem;      /* 缩小字体 */
+      color: #00ffcc;
+      letter-spacing: 1px;
+    }
+
+    /* 针对游戏界面的副标题缩小 */
+    #game-ui p {
+      font-size: 0.85rem;     /* 缩小说明文字 */
+      color: #aaa;
+      margin: 5px 0 0 0;
+    }
+
+    /* 通用文字样式 */
+    h1 { margin: 0 0 15px 0; color: #00ffcc; letter-spacing: 2px; }
+    p { font-size: 1.2rem; color: #ccc; line-height: 1.6; }
+    .hidden { opacity: 0; pointer-events: none; transform: scale(0.9); }
+
+    /* 准星样式 */
+    #cursor {
+      position: absolute;
+      width: 40px; height: 40px;
+      border: 2px solid rgba(255, 60, 60, 0.9);
+      border-radius: 50%;
+      transform: translate(-50%, -50%);
+      z-index: 5;
+      pointer-events: none;
+      display: none;
+      transition: border-color 0.1s, transform 0.1s;
+    }
+    #cursor::after {
+      content: ''; position: absolute; top: 50%; left: 50%;
+      width: 4px; height: 4px; background: #ff3333;
+      transform: translate(-50%, -50%); border-radius: 50%;
+    }
+    #cursor.shooting {
+      border-color: #fff; background-color: rgba(255, 50, 50, 0.4);
+      transform: translate(-50%, -50%) scale(0.7);
+    }
+  </style>
+</head>
+<body>
+
+    <div id="game-container">
+        <video id="input_video"></video>
+        <canvas id="game_canvas"></canvas>
+        <div id="cursor"></div>
+
+        <div id="ui-layer">
+            <div id="calibration-ui" class="instruction-box">
+                <h1>系统初始化</h1>
+                <p id="calib-text">正在加载视觉模型...</p>
+                <p id="sub-text" style="font-size: 0.9rem; color: #888; margin-top:10px"></p>
+            </div>
+            <div id="game-ui" class="instruction-box hidden">
+                <h1>得分: <span id="score">0</span></h1>
+                <p style="font-size: 0.9rem; color: #888">食指移动瞄准 · 大拇指弯曲射击</p>
+            </div>
+        </div>
+    </div>
+
+    <script>
+      // --- 配置参数 ---
+      const SMOOTHING_FACTOR = 0.15;      // 准星移动平滑度
+      const TRIGGER_THRESHOLD = 0.55;     // 射击触发阈值
+
+      // [优化] 稍微放宽静止阈值，配合平滑算法
+      const STABILITY_THRESHOLD = 0.005;
+      const CALIBRATION_FRAMES = 60;      // 校准所需时间 (约1秒)
+
+      // --- 全局变量 ---
+      const videoElement = document.getElementById('input_video');
+      const canvasElement = document.getElementById('game_canvas');
+      const ctx = canvasElement.getContext('2d');
+      const cursor = document.getElementById('cursor');
+      const calibUI = document.getElementById('calibration-ui');
+      const calibText = document.getElementById('calib-text');
+      const subText = document.getElementById('sub-text');
+      const gameUI = document.getElementById('game-ui');
+      const scoreEl = document.getElementById('score');
+
+      let state = 'LOADING';
+      let score = 0;
+      let w, h;
+      let targetX = 0, targetY = 0;
+      let currentX = 0, currentY = 0;
+      let isHandDetected = false;
+      let isShooting = false;
+      let lastShotTime = 0;
+
+      // 校准专用变量
+      let calibData = { minX: 0, minY: 0, maxX: 1, maxY: 1 };
+
+      // [优化] 新增校准平滑变量
+      let calibLogicTimer = 0;     // 逻辑计时器 (整数，负责判断完成)
+      let calibVisualProgress = 0; // 视觉进度 (0.0-1.0，负责UI动画)
+      let smoothedMovement = 0.01; // 平滑后的移动速度 (初始值设一点点防止瞬间误触)
+
+      let rawHeadX = 0, rawHeadY = 0;
+      let prevRawX = 0, prevRawY = 0;
+
+      // --- 初始化 ---
+      function resize() {
+        w = canvasElement.width = window.innerWidth;
+        h = canvasElement.height = window.innerHeight;
+        currentX = targetX = w / 2;
+        currentY = targetY = h / 2;
+      }
+      window.addEventListener('resize', resize);
+      resize();
+
+      // --- 游戏对象 (保持不变) ---
+      let particles = [];
+      let targets = [];
+
+      class Particle {
+        constructor(x, y, color) {
+          this.x = x; this.y = y;
+          const angle = Math.random() * Math.PI * 2;
+          const speed = Math.random() * 6 + 2;
+          this.vx = Math.cos(angle) * speed;
+          this.vy = Math.sin(angle) * speed;
+          this.life = 1.0;
+          this.decay = Math.random() * 0.02 + 0.015;
+          this.color = color;
+          this.gravity = 0.2;
+        }
+        update() {
+          this.x += this.vx; this.y += this.vy;
+          this.vy += this.gravity; this.life -= this.decay;
+        }
+        draw(ctx) {
+          ctx.globalAlpha = Math.max(0, this.life);
+          ctx.fillStyle = this.color;
+          ctx.beginPath(); ctx.arc(this.x, this.y, 3, 0, Math.PI * 2); ctx.fill();
+          ctx.globalAlpha = 1;
+        }
+      }
+
+      class Target {
+        constructor() {
+          this.radius = 45;
+          this.x = Math.random() * (w - 200) + 100;
+          this.y = Math.random() * (h - 200) + 100;
+          this.color = `hsl(${Math.random() * 60 + 10}, 80%, 60%)`;
+          this.active = true;
+          this.pulseOffset = Math.random() * 10;
+        }
+        draw(ctx, time) {
+          if (!this.active) return;
+          const pulse = Math.sin(time * 0.005 + this.pulseOffset) * 5;
+          ctx.setLineDash([10, 5]); ctx.strokeStyle = this.color; ctx.lineWidth = 2;
+          ctx.beginPath(); ctx.arc(this.x, this.y, this.radius + pulse + 5, 0, Math.PI * 2); ctx.stroke();
+          ctx.setLineDash([]);
+          ctx.fillStyle = this.color; ctx.globalAlpha = 0.2;
+          ctx.beginPath(); ctx.arc(this.x, this.y, this.radius + pulse, 0, Math.PI * 2); ctx.fill();
+          ctx.globalAlpha = 1;
+          ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.arc(this.x, this.y, 8, 0, Math.PI * 2); ctx.fill();
+        }
+        checkHit(x, y) {
+          if (!this.active) return false;
+          return Math.hypot(this.x - x, this.y - y) < this.radius + 15;
+        }
+      }
+
+      // --- MediaPipe ---
+      const hands = new Hands({locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`});
+      hands.setOptions({
+        maxNumHands: 1,
+        modelComplexity: 1,
+        minDetectionConfidence: 0.7,
+        minTrackingConfidence: 0.6
+      });
+
+      hands.onResults(onResults);
+
+      const camera = new Camera(videoElement, {
+        onFrame: async () => { await hands.send({image: videoElement}); },
+        width: 640, height: 480
+      });
+      camera.start();
+
+      // --- 核心逻辑 ---
+
+      function lerp(start, end, amt) { return (1 - amt) * start + amt * end; }
+
+      function onResults(results) {
+        if (!results.multiHandLandmarks || results.multiHandLandmarks.length === 0) {
+          isHandDetected = false;
+          // 如果手丢了，重置上一帧数据防止跳变
+          prevRawX = 0; prevRawY = 0;
+          return;
+        }
+
+        const lm = results.multiHandLandmarks[0];
+
+        // 如果上一帧没有数据，直接初始化为当前数据，防止第一帧计算出巨大速度
+        if (!isHandDetected) {
+          prevRawX = 1 - lm[8].x;
+          prevRawY = lm[8].y;
+        } else {
+          prevRawX = rawHeadX;
+          prevRawY = rawHeadY;
+        }
+        isHandDetected = true;
+
+        // 获取当前帧原始坐标 (镜像处理)
+        rawHeadX = 1 - lm[8].x;
+        rawHeadY = lm[8].y;
+
+        // 坐标映射
+        let mappedX = ((rawHeadX - calibData.minX) / (calibData.maxX - calibData.minX)) * w;
+        let mappedY = ((rawHeadY - calibData.minY) / (calibData.maxY - calibData.minY)) * h;
+
+        targetX = Math.max(0, Math.min(w, mappedX));
+        targetY = Math.max(0, Math.min(h, mappedY));
+
+        // 射击检测
+        const thumbTip = lm[4];
+        const indexMCP = lm[5];
+        const pinkyMCP = lm[17];
+        const distAction = Math.hypot(thumbTip.x - indexMCP.x, thumbTip.y - indexMCP.y);
+        const palmWidth = Math.hypot(indexMCP.x - pinkyMCP.x, indexMCP.y - pinkyMCP.y);
+        isShooting = distAction < (palmWidth * TRIGGER_THRESHOLD);
+      }
+
+      // --- 游戏/校准循环 ---
+      function loop() {
+        ctx.clearRect(0, 0, w, h);
+        const now = Date.now();
+
+        // 平滑移动
+        if (isHandDetected) {
+          currentX = lerp(currentX, targetX, SMOOTHING_FACTOR);
+          currentY = lerp(currentY, targetY, SMOOTHING_FACTOR);
+
+          if (state === 'PLAYING') {
+            cursor.style.display = 'block';
+            cursor.style.left = currentX.toFixed(1) + 'px';
+            cursor.style.top = currentY.toFixed(1) + 'px';
+          } else {
+            cursor.style.display = 'none';
+          }
+        }
+
+        // 状态机
+        if (state === 'LOADING') {
+          if (isHandDetected) {
+            setTimeout(() => state = 'CALIB_TL', 500);
+          }
+        }
+        else if (state.startsWith('CALIB')) {
+          runCalibrationLogic();
+        }
+        else if (state === 'PLAYING') {
+          runGameLogic(now);
+        }
+
+        // 渲染
+        targets.forEach(t => t.draw(ctx, now));
+        for (let i = particles.length - 1; i >= 0; i--) {
+          particles[i].update();
+          particles[i].draw(ctx);
+          if (particles[i].life <= 0) particles.splice(i, 1);
+        }
+
+        requestAnimationFrame(loop);
+      }
+      requestAnimationFrame(loop);
+
+      // --- 优化后的校准逻辑 ---
+
+      function runCalibrationLogic() {
+        // 1. 计算当前帧瞬时速度
+        const rawMovement = Math.hypot(rawHeadX - prevRawX, rawHeadY - prevRawY);
+
+        // 2. [关键] 对速度进行 Lerp 平滑 (低通滤波)
+        // 这样可以过滤掉偶尔一帧的跳变，只有持续移动才会让 smoothedMovement 变大
+        // 0.1 表示新值只占10%权重，非常平稳
+        smoothedMovement = lerp(smoothedMovement, rawMovement, 0.1);
+
+        const isStable = isHandDetected && smoothedMovement < STABILITY_THRESHOLD;
+
+        // 3. 逻辑计数 (Logic)
+        if (isStable) {
+          calibLogicTimer++;
+        } else {
+          // 如果不稳定，缓慢减少，而不是直接减太多
+          calibLogicTimer = Math.max(0, calibLogicTimer - 1);
+        }
+
+        // 限制最大值
+        calibLogicTimer = Math.min(calibLogicTimer, CALIBRATION_FRAMES);
+
+        // 4. [关键] 视觉进度平滑 (Visual)
+        // 让 UI 显示的进度条 追赶 逻辑计时器
+        // 即使 calibLogicTimer 在 59 和 60 之间跳动，UI 也会平滑过渡
+        const targetProgress = calibLogicTimer / CALIBRATION_FRAMES;
+        calibVisualProgress = lerp(calibVisualProgress, targetProgress, 0.15);
+
+        // 绘制辅助函数
+        const drawCornerGuide = (x, y, label, active) => {
+          ctx.strokeStyle = active ? '#fff' : '#444';
+          ctx.lineWidth = 2;
+          ctx.beginPath();
+          ctx.arc(x, y, 40, 0, Math.PI*2);
+          ctx.stroke();
+
+          // 使用平滑后的 visualProgress 绘制圆环
+          if (active && calibVisualProgress > 0.01) {
+            ctx.strokeStyle = '#00ffcc';
+            ctx.lineWidth = 6;
+            ctx.lineCap = 'round'; // 圆头让进度条更好看
+            ctx.beginPath();
+            ctx.arc(x, y, 40, -Math.PI/2, -Math.PI/2 + (Math.PI*2 * calibVisualProgress));
+            ctx.stroke();
+          }
+
+          ctx.fillStyle = active ? '#fff' : '#666';
+          ctx.font = "bold 16px Arial";
+          ctx.textAlign = "center";
+          ctx.textBaseline = "middle";
+          ctx.fillText(label, x, y);
+
+          if (active) {
+            ctx.fillStyle = '#00ffcc';
+            ctx.font = "14px Arial";
+            const statusText = calibVisualProgress > 0.2 ? "保持静止..." : "指向此处";
+            ctx.fillText(statusText, x, y + 60);
+          }
+        };
+
+        if (state === 'CALIB_TL') {
+          calibText.innerHTML = "<b>步骤 1/2</b><br>请指向屏幕 <span style='color:#00ffcc'>左上角</span> 并保持静止";
+          subText.innerText = "无需对准圆圈，只需指向你认为的角落";
+
+          drawCornerGuide(100, 100, "1", true);
+          drawCornerGuide(w-100, h-100, "2", false);
+
+          // 当逻辑计数器满时完成 (不用视觉进度判断，保证准确)
+          if (calibLogicTimer >= CALIBRATION_FRAMES) {
+            calibData.minX = rawHeadX;
+            calibData.minY = rawHeadY;
+            spawnSuccessParticles(100, 100);
+
+            // 重置变量
+            calibLogicTimer = 0;
+            calibVisualProgress = 0;
+            smoothedMovement = 1.0; // 强制设为非静止，防止立刻触发下一步
+            state = 'CALIB_BR';
+          }
+        }
+        else if (state === 'CALIB_BR') {
+          calibText.innerHTML = "<b>步骤 2/2</b><br>请指向屏幕 <span style='color:#00ffcc'>右下角</span> 并保持静止";
+          subText.innerText = "保持手部稳定即可触发";
+
+          drawCornerGuide(100, 100, "OK", false);
+          drawCornerGuide(w-100, h-100, "2", true);
+
+          if (calibLogicTimer >= CALIBRATION_FRAMES) {
+            calibData.maxX = rawHeadX;
+            calibData.maxY = rawHeadY;
+
+            if (calibData.maxX <= calibData.minX) calibData.maxX = calibData.minX + 0.1;
+            if (calibData.maxY <= calibData.minY) calibData.maxY = calibData.minY + 0.1;
+
+            spawnSuccessParticles(w-100, h-100);
+            startGame();
+          }
+        }
+      }
+
+      function spawnSuccessParticles(x, y) {
+        for(let i=0; i<20; i++) {
+          particles.push(new Particle(x, y, '#00ffcc'));
+        }
+      }
+
+      function runGameLogic(now) {
+        if (isShooting) {
+          cursor.classList.add('shooting');
+          if (now - lastShotTime > 250) {
+            fire();
+            lastShotTime = now;
+          }
+        } else {
+          cursor.classList.remove('shooting');
+        }
+      }
+
+      function startGame() {
+        state = 'PLAYING';
+        calibUI.classList.add('hidden');
+        gameUI.classList.remove('hidden');
+        spawnTarget();
+      }
+
+      function spawnTarget() {
+        if (state !== 'PLAYING') return;
+        if (targets.length < 3) targets.push(new Target());
+      }
+
+      function fire() {
+        for (let i = 0; i < 5; i++) particles.push(new Particle(currentX, currentY, '#fff'));
+
+        let hit = false;
+        for (let i = targets.length - 1; i >= 0; i--) {
+          if (targets[i].checkHit(currentX, currentY)) {
+            for(let j=0; j<15; j++) particles.push(new Particle(targets[i].x, targets[i].y, targets[i].color));
+            targets.splice(i, 1);
+            hit = true;
+            score += 100;
+          }
+        }
+        if (hit) {
+          scoreEl.innerText = score;
+          setTimeout(spawnTarget, 400);
+          setTimeout(spawnTarget, 800);
+        }
+      }
+
+    </script>
+</body>
+</html>
